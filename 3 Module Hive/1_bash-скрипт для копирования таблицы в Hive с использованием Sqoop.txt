@@ -13,6 +13,6 @@ hdfs dfs -rm -r -f -skipTrash $tabName >sqoop_stdout.txt 2>sqoop_stderr.txt
 echo "Done1"
 export JAVA_HOME="/usr" 
 echo "Done2"
-/usr/lib/sqoop/bin/sqoop import --connect 'jdbc:mysql://10.93.1.9/skillfactory' --username mysql --password arenadata --hive-import -m 1 --table $tabName --hive-table $dbName.$tabName
+/usr/lib/sqoop/bin/sqoop import --connect 'jdbc:mysql://10.93.0.0/skillfactory' --username m1 --password p1 --hive-import -m 1 --table $tabName --hive-table $dbName.$tabName
 echo "Done" 
 EOF
