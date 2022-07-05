@@ -1,0 +1,749 @@
+1. From MySQL to Hive
+
+%sh
+cat > /tmp/1ilya/airflow/dags/sqoop1.py <<EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+
+
+import datetime
+
+# настройки
+
+DAG_NAME = 'LoadTables1'
+tableName = Variable.get(DAG_NAME+"_TABLE") 
+
+# Инициализация
+dag = DAG( dag_id=DAG_NAME, schedule_interval=None, start_date=datetime.datetime(2022, 6, 1),)
+
+# Перенос из mysql в hive 
+sqoopTableCmd = """
+export JAVA_HOME=/usr
+hdfs dfs -rm -r -skipTrash /tmp/{0} >/dev/null 2>&1
+sqoop import --connect jdbc:mysql://10.93.1.9/skillfactory --username mysql --password arenadata \
+--table {0} --hive-import --hive-table 1ilya_airflow.air_{0} -m 1
+""".format(tableName)
+  
+sqoopTable = BashOperator( task_id='skoopTable', bash_command=sqoopTableCmd, dag=dag)
+
+# создание orc таблицы 
+createOrcTableCmd = """
+/usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+drop table if exists air_{0}_orc purge;
+create table 1ilya_airflow.{0}_orc_new stored as orc as select * from 1ilya_airflow.air_{0}
+END_SQL
+""".format(tableName)
+  
+createOrcTable = BashOperator( task_id='createOrcTable', bash_command=createOrcTableCmd, dag=dag)
+
+sqoopTable >> createOrcTable
+EOF
+
+
+
+2. Load SCV to Staging
+
+%sh
+cat > /tmp/1ilya/airflow/dags/csv_hdfs_to_hive.py <<EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+import datetime
+import subprocess,os
+
+# настройки
+
+DAG_NAME = 'LoadCSV'
+tableNames = Variable.get(DAG_NAME+"_TABLES") 
+sched = None
+stDt = datetime.datetime(2022, 6, 1)
+
+# обрабатывают результаты работы сабдагов
+def addToFailed(name):
+
+    if Variable.get("FAILED")=="None": 
+        Variable.set("FAILED",name)
+    else:
+        Variable.set("FAILED",Variable.get("FAILED")+","+name)
+    
+def transState(name,state):
+
+    if state and Variable.get("RUNNING")!="None":
+        addToFailed(Variable.get("RUNNING"))
+    if not state:
+        name = "None"
+    Variable.set("RUNNING",name)
+
+# инициализация переменных в начале DAG-а
+def initTrans():
+
+    Variable.set("RUNNING","None")
+    Variable.set("FAILED","None")
+
+# проверка результатов работы subdag-а
+def checkTrans():
+    """проверяет завершенность всех шагов и, если какие-то были не завершены - фейлит задачу """
+    
+    if Variable.get("RUNNING")!="None": # предыдущая таблица зафейлилась, добавляем ее имя в FAILED
+        addToFailed(Variable.get("RUNNING"))
+        
+    if Variable.get("FAILED")!="None":
+        raise AirflowException
+
+# Скрипт переноса в HDFS
+def copyToHdfs(fileName,hdfsDir,hdfsName):
+    
+    stdErr = open('hdfs_stderr.txt','w')
+    stdOut = open('hdfs_stdout.txt','w')
+    if hdfsName: # если hdfsName не пустой - делаем директорию 
+        print("Copying", fileName, "into HDFS...")
+        res = subprocess.run(["hdfs","dfs","-mkdir","-p",hdfsDir],stderr=stdErr,stdout=stdOut) 
+    else: # иначе, удаляем директорию hdfsDir
+        print("Deleting", hdfsDir, "from HDFS...")
+        res = subprocess.run(["hdfs","dfs","-rm","-r","-f","-skipTrash",hdfsDir],stderr=stdErr,stdout=stdOut) 
+    stdOut.close()
+    stdErr.close()
+    if res.returncode!=0:
+        raise(subprocess.SubprocessError("There were errors while working with dir, check hdfs_stderr.txt"))
+    if not hdfsName: 
+        print("Done")
+        return
+    stdErr = open('hdfs_stderr.txt','w')
+    stdOut = open('hdfs_stdout.txt','w')
+    res = subprocess.run(["hdfs","dfs","-put","-f",fileName,hdfsDir+"/"+hdfsName],stderr=stdErr,stdout=stdOut) # копируем локальный файл в hdfs 
+    stdOut.close()
+    stdErr.close()
+    if res.returncode!=0:
+        raise(subprocess.SubprocessError("There were errors while copying, check hdfs_stderr.txt"))
+    print("Done")
+
+# исполняем Hive запрос
+def execHiveCmd(sql):
+    print("Executing Hive QL command:", sql, "...")
+    cmdFile = open("/tmp/sql.txt","w")
+    cmdFile.write("!connect  jdbc:hive2://10.93.1.9:10000 hive eee;\n")
+    cmdFile.write(sql + ";")
+    cmdFile.close()
+    args = [
+        'beeline',
+        '-f',
+        '/tmp/sql.txt'
+    ]
+    stdErr = open('hive_stderr.txt','w')
+    stdOut = open('hive_stdout.txt','w')
+    res = subprocess.run(args,stderr=stdErr,stdout=stdOut)
+    stdOut.close()
+    stdErr.close()
+    if res.returncode!=0:
+        raise(subprocess.SubprocessError("There were errors while making hive table, check hive_stderr.txt"))
+    print("Done")
+    
+# создание subdag'а
+
+def sub_dag(parent_dag_name, start_date, schedule_interval, tableName):
+    
+    dag = DAG('%s.%s'%(parent_dag_name, tableName), schedule_interval=schedule_interval, start_date=start_date )
+    
+    # рператоры начала/окончания переноса таблиц в хайв
+    startTrans = PythonOperator ( task_id="initTrans", python_callable=transState, op_args=[tableName,True], dag=dag )
+    commitTrans = PythonOperator ( task_id="commitTrans", python_callable=transState, op_args=[tableName,False], dag=dag )
+    
+    # перенос локальных данных в hdfs
+    if tableName == "nobel_laureates": 
+        fileName = "/home/deng/Data/nobel-laureates.csv"
+    else: 
+        fileName = "/home/deng/Data/countries_of_the_world.csv"
+    dbName = "1ilya_airflow"
+    hiveTab = dbName + "." + tableName
+
+    SQLcmdLaureates = """
+    create external table 1ilya_airflow.nobel_laureates_ext_new ( year int, 
+                    category varchar(50), 
+                    prize varchar(255), 
+                    motivation string, 
+                    prize_share string, 
+                    laureate_id int, 
+                    laureate_type string, 
+                    full_name string, 
+                    birth_date date, 
+                    birth_city string, 
+                    birth_country string, 
+                    sex varchar(6), 
+                    organization_name string, 
+                    organization_city string, 
+                    organization_country string,  
+                    death_date date, 
+                    death_city string, 
+                    death_country string )
+                    PARTITIONED BY (act_date date) row format SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' location '/1ilya/{0}' 
+     """.format(tableName)
+    SQLcmdCountries = """
+     create external table " +
+     hiveTab + " (country varchar(255), 
+                    region varchar(255) ,
+                    population int, 
+                    area decimal(15,3), 
+                    pop_density decimal(15,3), 
+                    coastline decimal(15,3),  
+                    net_migration decimal(15,3), 
+                    infant_mortality decimal(15,3), 
+                    gdp decimal(15,3), 
+                    literacy decimal(15,3), 
+                    phones decimal(15,3), 
+                    arable decimal(15,3), 
+                    other decimal(15,3),
+                    crops decimal(15,3), 
+                    climate decimal(15,3),
+                    birthratedecimal decimal(15,3),
+                    deathrate decimal(15,3), 
+                    agriculture decimal(15,3), 
+                    industry decimal(15,3) ,
+                    service decimal(15,3),)
+                    PARTITIONED BY (act_date date) row format SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' location '/1ilya/{0}'
+                    """.format(tableName)
+ 
+    # Собираем вышенаписанный код в операторы и создаем граф
+    copytoHDFS = PythonOperator(task_id='copyToHdfs', python_callable=copyToHdfs, op_args=[fileName,"/1ilya/"+tableName,"data.csv"])
+    if tableName == "nobel_laureates": 
+        create_ext_table = PythonOperator(task_id='create_ext_table', python_callable=execHiveCmd, op_args=[SQLcmdLaureates])
+    else:
+        create_ext_table = PythonOperator(task_id='create_ext_table', python_callable=execHiveCmd, op_args=[SQLcmdCountries])
+    create_orc_table = PythonOperator(task_id='create_orc_table', python_callable=execHiveCmd, op_args=["create table "+hiveTab+"_orc stored as ORC as select * from "+hiveTab])
+    drop_table = PythonOperator(task_id='drop_table', python_callable=execHiveCmd, op_args=["drop table " + hiveTab + " purge"])
+    drop_dir = PythonOperator(task_id='drop_dir', python_callable=copyToHdfs, op_args=[fileName,"/1ilya/"+tableName,None])
+   
+    startTrans >> copytoHDFS >>create_ext_table>>create_orc_table>> drop_table>>drop_dir >> commitTrans
+    
+    return dag
+
+# основной DAG
+main_dag = DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stDt, catchup=False )
+
+# операторы начала и завершения
+initialOp = PythonOperator( task_id='initialOp', python_callable=initTrans, dag=main_dag)
+finalOp = PythonOperator( task_id='finalOp', python_callable=checkTrans, dag=main_dag, trigger_rule='all_done')
+
+prevDag = initialOp
+for tab in tableNames.split(","):
+    nextDag = SubDagOperator( subdag=sub_dag(DAG_NAME,stDt,sched,tab),task_id=tab, dag=main_dag, trigger_rule='all_done' )
+    prevDag >> nextDag
+    prevDag = nextDag
+prevDag >> finalOp
+EOF
+
+
+
+3.  Json to Staging
+
+%sh
+cat > /tmp/1ilya/airflow/dags/json_to_hive.py <<EOF
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow import AirflowException
+from airflow.operators.bash_operator import BashOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.subdag_operator import SubDagOperator
+
+import datetime
+import subprocess,os
+
+# настройки
+
+DAG_NAME = 'load_jsons_to_HDFS'
+tableNames = Variable.get(DAG_NAME+"_TABLES") 
+sched = None
+stDt = datetime.datetime(2019, 12, 8)
+
+# обрабатывают результаты работы сабдагов
+def addToFailed(name):
+
+    if Variable.get("FAILED")=="None": 
+        Variable.set("FAILED",name)
+    else:
+        Variable.set("FAILED",Variable.get("FAILED")+","+name)
+    
+def transState(name,state):
+
+    if state and Variable.get("RUNNING")!="None":
+        addToFailed(Variable.get("RUNNING"))
+    if not state:
+        name = "None"
+    Variable.set("RUNNING",name)
+
+# инициализация переменных в начале DAG-а
+def initTrans():
+
+    Variable.set("RUNNING","None")
+    Variable.set("FAILED","None")
+
+# проверка результатов работы subdag-а
+def checkTrans():
+    if Variable.get("RUNNING")!="None": # предыдущая таблица зафейлилась, добавляем ее имя в FAILED
+        addToFailed(Variable.get("RUNNING"))
+        
+    if Variable.get("FAILED")!="None":
+        raise AirflowException
+
+# Скрипт переноса в HDFS
+def copyToHdfs(fileName,hdfsDir,hdfsName):
+
+    stdErr = open('hdfs_stderr.txt','w')
+    stdOut = open('hdfs_stdout.txt','w')
+    if hdfsName: # если hdfsName не пустой - делаем директорию 
+        print("Copying", fileName, "into HDFS...")
+        res = subprocess.run(["hdfs","dfs","-mkdir","-p",hdfsDir],stderr=stdErr,stdout=stdOut) 
+    else: # иначе, удаляем директорию hdfsDir
+        print("Deleting", hdfsDir, "from HDFS...")
+        res = subprocess.run(["hdfs","dfs","-rm","-r","-f","-skipTrash",hdfsDir],stderr=stdErr,stdout=stdOut) 
+    stdOut.close()
+    stdErr.close()
+    if res.returncode!=0:
+        raise(subprocess.SubprocessError("There were errors while working with dir, check hdfs_stderr.txt"))
+    if not hdfsName: 
+        print("Done")
+        return
+    stdErr = open('hdfs_stderr.txt','w')
+    stdOut = open('hdfs_stdout.txt','w')
+    res = subprocess.run(["hdfs","dfs","-put","-f",fileName,hdfsDir+"/"+hdfsName],stderr=stdErr,stdout=stdOut) # копируем локальный файл в hdfs 
+    stdOut.close()
+    stdErr.close()
+    if res.returncode!=0:
+        raise(subprocess.SubprocessError("There were errors while copying, check hdfs_stderr.txt"))
+    print("Done")
+    
+#переводим json в сsv
+def to_csv(fileName, tabName, col_1, col_2): 
+    csv_path = f'/home/deng/Data/{tabName}.csv'
+    with open(fileName) as capital_file:
+        dict_capital =json.load(capital_file)
+    prepared_dict = {i: x for i, x in enumerate(dict_capital.items())}
+    DF =pd.DataFrame.from_dict(prepared_dict, orient='index', columns=[col_1,col_2])
+    print(DF)
+    DF.to_csv(csv_path, index=False, header=True)
+    
+# создание subdag'а
+
+def sub_dag(parent_dag_name, start_date, schedule_interval, tabName, col_1, col_2):
+    
+    dag = DAG('%s.%s'%(parent_dag_name, tabName), schedule_interval=schedule_interval, start_date=start_date )
+
+    dbName = "1ilya_airflow"
+    hiveTab = dbName + "." + tabName
+    # делаем из json файлов сsv
+        
+    fileName =  f'/home/deng/Data/{tabName}.csv'
+        
+    createExtTableCmd = """
+    /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+    create external table {0} ({1} varchar(255),{2} varchar(255)) row format delimited fields terminated by ',' location '/1ilya/{3}'
+    END_SQL
+    """.format(hiveTab, col_1, col_2, tabName)
+    
+        
+    createORCTableCmd = """
+    /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+    create table {0}_orc stored as ORC as select * from {0}
+    END_SQL
+    """.format(hiveTab)
+        
+        
+    dropTableCmd = """
+    /usr/bin/beeline -u jdbc:hive2://localhost:10000/default -n hive -p 123 <<END_SQL
+    drop table {0} purge
+    END_SQL
+    """.format(hiveTab)
+        
+    toCSV = PythonOperator ( task_id="toCSV", python_callable=to_csv, op_args=[f'/home/deng/Data/{tabName}.json',tabName,col_1,col_2], dag=dag )
+    copytoHDFS = PythonOperator(task_id='copyToHdfs', python_callable=copyToHdfs, op_args=[fileName,"/1ilya/"+tabName,"data.csv"], dag=dag)
+    create_ext_table = BashOperator( task_id='createExtTableCmd', bash_command=createExtTableCmd, dag=dag)
+    create_orc_table = BashOperator( task_id='createORCTableCmd', bash_command=createORCTableCmd, dag=dag)
+    drop_table = BashOperator( task_id='drop_table', bash_command=dropTableCmd, dag=dag)
+    drop_dir = PythonOperator(task_id='drop_dir', python_callable=copyToHdfs, op_args=[fileName,"/1ilya/"+tabName,None], dag=dag)
+     
+       
+    toCSV>> copytoHDFS >>create_ext_table>>create_orc_table>> drop_table>>drop_dir 
+    
+    return dag
+    
+# основной DAG
+main_dag = DAG( dag_id=DAG_NAME, schedule_interval=sched, start_date=stDt, catchup=False )
+
+# операторы начала и завершения
+initialOp = PythonOperator( task_id='initialOp', python_callable=initTrans, dag=main_dag)
+finalOp = PythonOperator( task_id='finalOp', python_callable=checkTrans, dag=main_dag, trigger_rule='all_done')
+tabNames= ['capital','continent','currency','iso3','names','phones']
+cols_1 = ['ISO_country','ISO_country','ISO_country','ISO2','ISO_country','ISO_country']
+cols_2 = ['Capital','ISO_continent','Currency','ISO3','country_names','phone_code']
+tableNames = ['capital','continent','currency','iso3','names','phones']
+prevDag = initialOp
+i = 0
+for tab in tableNames:
+    col_1 =cols_1[i]
+    col_2 =cols_2[i]
+    nextDag = SubDagOperator( subdag=sub_dag(DAG_NAME,stDt,sched,tab, col_1, col_2),task_id=tab, dag=main_dag, trigger_rule='all_done' )
+    prevDag >> nextDag
+    prevDag = nextDag
+    i=i+1
+prevDag >> finalOp
+nextDag = SubDagOperator( subdag=sub_dag(DAG_NAME,stDt,sched,tab, col_1, col_2),task_id=tab, dag=main_dag, trigger_rule='all_done' )
+nextDag
+EOF
+
+
+
+4. Snowflake and Dataset
+
+%hive
+create database if not exists 1ilya_airflow1
+
+%sh
+cat > /tmp/1ilya/airflow/dags/spark.py <<EOF
+import sys
+sys.path.append('/usr/lib/spark/python')
+sys.path.append('/usr/lib/spark/python/lib/py4j-0.10.7-src.zip')
+
+import os, datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql import Row, functions as F
+from pyspark.sql.window import Window
+from pyspark.sql import functions as f
+from pyspark.sql.functions import row_number
+from airflow.models import DAG
+from airflow.models import Variable
+from airflow.operators.python_operator import PythonOperator
+import os
+import pandas as pd
+
+schedule = None
+stDt = datetime.datetime(2019, 12, 8)
+def doImport():
+    os.environ["JAVA_HOME"] = "/usr"
+    os.environ["PYSPARK_PYTHON"] = "/usr/bin/python3"
+    os.environ["PYSPARK_DRIVER_PYTHON"] = "python3"
+    os.environ["PYSPARK_SUBMIT_ARGS"] = """--driver-class-path /usr/share/java/mysql-connector-java.jar --jars /usr/share/java/mysql-connector-java.jar pyspark-shell"""
+    
+    spark = SparkSession.builder.master("yarn-client").appName("spark_airflow").config("hive.metastore.uris", "thrift://10.93.1.9:9083").enableHiveSupport().getOrCreate()
+   
+        
+    # воспроизводим шаги из модуля 4
+    def save_tables_as_df(db, table_list=None):
+        """Saving tables from database
+        Args:
+            db: string, database name
+            table_list: list of pyspark sql rows or None, names of tables. If None - collects all tables from database
+        Return:
+            df_list: list of dataframes
+        """
+        df_list = []
+    
+        if table_list  == None:
+            table_list = spark.sql(f"SHOW TABLES IN {db}").select("tableName").collect()
+        
+        for row in table_list:
+            name = row["tableName"]
+            df = spark.sql(f"SELECT * FROM {db}.{name}")
+            df_list.append(df)
+
+        return df_list
+    
+    my_dfs = save_tables_as_df('1ilya_airflow1')
+
+    # добавим айди городов, стран, лауреатов
+    my_dfs[1] = my_dfs[1].select(f.monotonically_increasing_id().alias('city_id'), '*')
+    my_dfs[4] = my_dfs[4].select(f.monotonically_increasing_id().alias('country_id'), '*')
+    my_dfs[8] = my_dfs[8].select(f.monotonically_increasing_id().alias('nl_id'), '*')
+    
+    # судя по выравниванию названий стран в табл. countries of the world - там есть лишние пробелы
+    my_dfs[4] = my_dfs[4].withColumn("country", f.trim(f.col("country")))
+    # заменим "and" на "&"
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), " and ", " & "))
+    my_dfs[5] = my_dfs[5].withColumn("country_name", f.regexp_replace(f.col("country_name"), " and ", " & "))
+    #"Saint" на "St"
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Saint", "St"))
+    my_dfs[5] = my_dfs[5].withColumn("country_name", f.regexp_replace(f.col("country_name"), "Saint", "St"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Bahamas, The", "Bahamas"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "British Virgin Is.", "British Virgin Islands"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Burma", "Myanmar"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Central African Rep.", "Central African Republic"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Congo, Dem. Rep.", "Democratic Republic of the Congo"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Congo, Repub. of the", "Republic of the Congo"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Cote d'Ivoire", "Ivory Coast"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Gambia, The", "Gambia"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Gaza Strip", "Palestinian Territory"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Korea, North", "North Korea"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Korea, South", "South Korea"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Macau", "Macao"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Micronesia, Fed. St.", "Micronesia"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "N. Mariana Islands", "Northern Mariana Islands"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "Turks & Caicos Is", "Turks & Caicos Islands"))
+    my_dfs[4] = my_dfs[4].withColumn("country", f.regexp_replace(f.col("country"), "West Bank", "Palestinian Territory"))
+    for i in [0,2,3,5,6,7,9]:
+        my_dfs[i] = my_dfs[i].withColumnRenamed("country_id", "iso_2")
+    my_dfs[4] = my_dfs[4].withColumnRenamed("country", "name")
+    joinExpression = my_dfs[4]["name"] == my_dfs[5]["country_name"]
+    joinType = "left"
+    df_tmp = my_dfs[4].join(my_dfs[5], joinExpression, joinType).drop("country_name")
+    df_tmp = df_tmp.withColumnRenamed("iso_2", "country_iso2")
+    df_tmp = df_tmp.withColumn("country_iso2", f.when(f.col("name")=="Netherlands Antilles", "AN").otherwise(f.col("country_iso2")))
+    df_tmp = df_tmp.withColumn("country_iso2", f.when(f.col("name")=="Virgin Islands", "VI").otherwise(f.col("country_iso2")))
+    
+    def custom_join(df1, df2):
+        joinExpression = df1["country_iso2"] == df2["iso_2"]
+        joinType = "left"
+        result = df1.join(df2, joinExpression, joinType).drop("iso_2")
+        return result
+
+    for i in [0,3,6,7,9]:
+        df_tmp = custom_join(df_tmp, my_dfs[i])
+    
+    df_tmp = df_tmp.withColumn("iso3_code", f.when(f.col("name")=="Netherlands Antilles", "ANT").otherwise(f.col("iso3_code")))
+    df_tmp = df_tmp.withColumn("phone", f.when(f.col("name")=="Netherlands Antilles", "399").otherwise(f.col("phone")))
+    df_tmp = df_tmp.withColumn("continent", f.when(f.col("name")=="Netherlands Antilles", "SA").otherwise(f.col("continent")))
+    df_tmp = df_tmp.withColumn("capital", f.when(f.col("name")=="Netherlands Antilles", "Willemstad").otherwise(f.col("capital")))
+    cities = df_tmp
+    
+    df_tmp = my_dfs[1]
+    df_tmp = df_tmp.withColumn("country", f.upper(f.col("country"))).orderBy("city_id")
+    part_to_join = countries.select("country_id", "country_iso2").dropDuplicates(["country_iso2"])
+
+    joinExpression = df_tmp["country"] == part_to_join["country_iso2"]
+    joinType = "left"
+    df_tmp = df_tmp.join(part_to_join, joinExpression, joinType).drop("country").orderBy("city_id")
+    cities = df_tmp
+    
+    laureates = my_dfs[8]
+    laureates = laureates.withColumn("birth_city", f.when(f.col("birth_city").contains("("), f.regexp_extract(f.col("birth_city"), r"\(([^()]+)\)$", 1)).otherwise(f.col("birth_city")))
+    laureates = laureates.withColumn("birth_country", f.when(f.col("birth_country").contains("("), f.regexp_extract(f.col("birth_country"), r"\(([^()]+)\)$", 1)).otherwise(f.col("birth_country")))
+    laureates = laureates.withColumn("organization_city", f.when(f.col("organization_city").contains("("), f.regexp_extract(f.col("organization_city"), r"\(([^()]+)\)$", 1)).otherwise(f.col("organization_city")))
+    laureates = laureates.withColumn("organization_country", f.when(f.col("organization_country").contains("("), f.regexp_extract(f.col("organization_country"), r"\(([^()]+)\)$", 1)).otherwise(f.col("organization_country")))
+    laureates = laureates.withColumn("death_city", f.when(f.col("death_city").contains("("), f.regexp_extract(f.col("death_city"), r"\(([^()]+)\)$", 1)).otherwise(f.col("death_city")))
+    laureates = laureates.withColumn("death_country", f.when(f.col("death_country").contains("("), f.regexp_extract(f.col("death_country"), r"\(([^()]+)\)$", 1)).otherwise(f.col("death_country")))
+
+    laureates = laureates.withColumn("birth_city", f.substring_index(f.col("birth_city"), ',', 1))
+    laureates = laureates.withColumn("organization_city", f.substring_index(f.col("organization_city"), ',', 1))
+    laureates = laureates.withColumn("death_city", f.substring_index(f.col("death_city"), ',', 1))
+    
+    for i in [birth,death,org]:
+        i.columns = ['city', 'country']
+    city_cut = birth.append([death,org]).drop_duplicates()
+    
+    city_cut = city_cut.reset_index()
+    city_cut.columns = ['city_id', 'city_name', 'city_country']
+    city_cut = spark.createDataFrame(city_cut)
+    
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "United States of America", "United States"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Federal Republic of Germany", "Germany"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Union of Soviet Socialist Republics", "Russia"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Northern Ireland", "Ireland"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Bosnia and Herzegovina", "Bosnia & Herzegovina"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "then Germany, now France", "France"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Czechoslovakia", "Czech Republic"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "East Germany", "Germany"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Trinidad", "Trinidad & Tobago"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "People's Republic of China", "China"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Saint Lucia", "St Lucia"))
+    city_cut =  city_cut.withColumn("city_country", f.regexp_replace(f.col("city_country"), "Guadeloupe Island", "Guadeloupe"))
+    
+    part_to_join = countries.select("name", "country_iso2","country_id").dropDuplicates(["country_iso2"])
+    joinExpression = city_cut["city_country"] == part_to_join["name"]
+    joinType = "left"
+    df_tmp = city_cut.join(part_to_join, joinExpression, joinType).drop("name").orderBy("city_id")
+    part_to_join = cities.select("city", "region", "population","latitude", "longitude", 'country_iso2')
+    part_to_join = part_to_join.withColumnRenamed('country_iso2','iso2')
+    part_to_join = part_to_join.withColumn('city', f.initcap(f.col('city')))
+    
+    df_tmp = df_tmp.toPandas()
+    df_tmp.columns = ['city_id', 'city_name', 'city_country', 'country_iso2', 'country_id', 'region', 'population', 'latitude', 'longitude', 'iso2']
+    df_tmp.drop([ 'iso2'], axis = 1, inplace = True)
+    df_tmp = spark.createDataFrame(df_tmp)
+    
+    l = ['city_country','country_iso2', 'region', 'population', 'latitude', 'longitude']
+    d = {x :'first' for x in l}
+    df_tmp1 = df_tmp.orderBy("population", ascending=False).groupBy("city_name").agg(d)
+    df_tmp1 = df_tmp1.toPandas().reset_index()
+    df_tmp1.columns = ['city_id', 'city_name', 'latitude', 'population',
+       'country_iso2', 'longitude', 'city_country',
+       'region']
+    cities = spark.createDataFrame(df_tmp1)
+    
+    cts_join = cities.select(['city_id', 'city_name'])
+    ctr_join = countries.select(['country_id', 'name'])
+    
+    for i in ['birth_country', 'death_country', 'organization_country']:
+
+        joinExpression = laureates[f'{i}'] == ctr_join["name"]
+        joinType = "left"
+        laureates = laureates.join(ctr_join, joinExpression, joinType).drop("name")
+        laureates = laureates.withColumnRenamed("country_id", f"{i}_id")
+    laureates = laureates.drop('birth_country', 'death_country', 'organization_country')
+        
+    for i in ['birth_','death_','organization_']:
+
+        joinExpression = [laureates[f'{i}city'] == cts_join["city_name"]]
+        joinType = "left"
+        laureates = laureates.join(cts_join, joinExpression, joinType).drop("city_name")
+        laureates = laureates.withColumnRenamed("city_id", f"{i}city_id")
+    laureates = laureates.drop('birth_city','death_city', 'organization_city')
+    laureates = laureates.withColumnRenamed('bith_date','birth_date')
+    
+    сities.write.clusterBy(16, "country").format("orc") \
+        .mode('overwrite') \
+        .option("compression","gzip") \
+        .saveAsTable("1ilya_airflow1.cities")
+    
+    countries.write.clusterBy(16, "continent").format("orc") \
+        .mode('overwrite') \
+        .option("compression","gzip") \
+        .saveAsTable("1ilya_airflow1.cities")
+    
+    laureates.write.clusterBy(16, "year").format("orc") \
+        .mode('overwrite') \
+        .option("compression","gzip") \
+        .saveAsTable("1ilya_airflow1.laureates")
+    
+    spark.sql("""CREATE TABLE IF NOT EXISTS 1ilya_airflow1.dataset STORED AS ORC AS SELECT
+    nl.nl_id
+    ,nl.year
+    ,nl.category
+    ,nl.prize
+    ,nl.motivation
+    ,nl.prize_share
+    ,nl.laureate_type
+    ,nl.full_name
+    ,nl.sex
+    ,nl.birth_date
+    ,nl.birth_city_id
+    ,nl.birth_country_id
+    ,nl.organization_name
+    ,nl.organization_city_id
+    ,nl.organization_country_id
+    ,nl.death_date
+    ,nl.death_city_id
+    ,nl.death_country_id
+    ,cit.city_country AS birth_country_name
+    ,cit.city_name AS birth_city_name
+    ,cit.region AS birth_city_region
+    ,cit.population as birth_city_population
+    ,cit.latitude AS birth_city_latitude
+    ,cit.longitude AS birth_city_longitude
+    ,cot.region AS birth_country_region
+    ,cot.population AS birth_country_population
+    ,cot.area AS birth_country_area
+    ,cot.pop_density AS birth_country_pop_density
+    ,cot.coastline AS birth_country_coastline
+    ,cot.net_migration AS birth_country_net_migration
+    ,cot.inf_mortality AS birth_country_inf_mortality
+    ,cot.gdp AS birth_country_gdp
+    ,cot.literacy AS birth_country_literacy
+    ,cot.phones AS birth_country_phones
+    ,cot.arable AS birth_country_arable
+    ,cot.crops AS birth_country_crops
+    ,cot.other AS birth_country_other
+    ,cot.climate AS birth_country_climate
+    ,cot.birthrate AS birth_country_birthrate
+    ,cot.deathrate AS birth_country_deathrate
+    ,cot.agriculture AS birth_country_agriculture
+    ,cot.industry AS birth_country_industry
+    ,cot.service AS birth_country_service
+    ,cot.country_iso2 AS birth_country_iso2
+    ,cot.iso3_code AS birth_country_iso3
+    ,cot.continent AS birth_country_continent_code
+    ,cot.currency AS birth_country_currency_code
+    ,cot.phone AS birth_country_phone_code
+    ,cot.capital AS birth_country_capital
+    ,dcit.city_country AS death_country_name
+    ,dcit.city_name AS death_city_name
+    ,dcit.region AS death_city_region
+    ,dcit.population as death_city_population
+    ,dcit.latitude AS death_city_latitude
+    ,dcit.longitude AS death_city_longitude
+    ,dcot.region AS death_country_region
+    ,dcot.population AS death_country_population
+    ,dcot.area AS death_country_area
+    ,dcot.pop_density AS death_country_pop_density
+    ,dcot.coastline AS death_country_coastline
+    ,dcot.net_migration AS death_country_net_migration
+    ,dcot.inf_mortality AS death_country_inf_mortality
+    ,dcot.gdp AS death_country_gdp
+    ,dcot.literacy AS death_country_literacy
+    ,dcot.phones AS death_country_phones
+    ,dcot.arable AS death_country_arable
+    ,dcot.crops AS death_country_crops
+    ,dcot.other AS death_country_other
+    ,dcot.climate AS death_country_climate
+    ,dcot.birthrate AS death_country_birthrate
+    ,dcot.deathrate AS death_country_deathrate
+    ,dcot.agriculture AS death_country_agriculture
+    ,dcot.industry AS death_country_industry
+    ,dcot.service AS death_country_service
+    ,dcot.country_iso2 AS death_country_iso2
+    ,dcot.iso3_code AS death_country_iso3
+    ,dcot.continent AS death_country_continent_code
+    ,dcot.currency AS death_country_currency_code
+    ,dcot.phone AS death_country_phone_code
+    ,dcot.capital AS death_country_capital
+    ,ocit.city_country AS organization_country_name
+    ,ocit.city_name AS organization_city_name
+    ,ocit.region AS organization_city_region
+    ,ocit.population as organization_city_population
+    ,ocit.latitude AS organization_city_latitude
+    ,ocit.longitude AS organization_city_longitude
+    ,ocot.region AS organization_country_region
+    ,ocot.population AS organization_country_population
+    ,ocot.area AS organization_country_area
+    ,ocot.pop_density AS organization_country_pop_density
+    ,ocot.coastline AS organization_country_coastline
+    ,ocot.net_migration AS organization_country_net_migration
+    ,ocot.inf_mortality AS organization_country_inf_mortality
+    ,ocot.gdp AS organization_country_gdp
+    ,ocot.literacy AS organization_country_literacy
+    ,ocot.phones AS organization_country_phones
+    ,ocot.arable AS organization_country_arable
+    ,ocot.crops AS organization_country_crops
+    ,ocot.other AS organization_country_other
+    ,ocot.climate AS organization_country_climate
+    ,ocot.birthrate AS organization_country_birthrate
+    ,ocot.deathrate AS organization_country_deathrate
+    ,ocot.agriculture AS organization_country_agriculture
+    ,ocot.industry AS organization_country_industry
+    ,ocot.service AS organization_country_service
+    ,ocot.country_iso2 AS organization_country_iso2
+    ,ocot.iso3_code AS organization_country_iso3
+    ,ocot.continent AS organization_country_continent_code
+    ,ocot.currency AS organization_country_currencyt_code
+    ,ocot.phone AS organization_country_phone_code
+    ,ocot.capital AS organization_country_capital
+
+    FROM 1ilya_airflow1.laureates nl
+    LEFT JOIN 1ilya_airflow1.cities cit
+        ON cit.city_id = nl.birth_city_id
+    LEFT JOIN 1ilya_airflow1.countries cot
+        ON cot.country_id = nl.birth_country_id
+    LEFT JOIN 1ilya_airflow1.cities dcit
+        ON dcit.city_id = nl.death_city_id
+    LEFT JOIN 1ilya_airflow1.countries dcot
+        ON dcot.country_id = nl.death_country_id
+    LEFT JOIN 1ilya_airflow1.cities ocit
+        ON ocit.city_id = nl.organization_city_id
+    LEFT JOIN 1ilya_airflow1.countries ocot
+        ON ocot.country_id = nl.organization_country_id
+    """)
+    spark.stop() 
+    
+DAG_NAME = "spark"
+schedule = None
+
+dag = DAG( dag_id=DAG_NAME, schedule_interval=schedule, start_date=datetime.datetime(2019, 12, 10), catchup=False )
+
+doImport = PythonOperator( task_id='doImport', python_callable=doImport, dag=dag)
+
+# DAG
+doImport
+EOF

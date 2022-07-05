@@ -1,0 +1,34 @@
+Создайте утилитный bash-скрипт для выполнения SQL-команды Hive с использованием beeline. Скопируйте его текст в строку ниже.
+Какой SQL команды? Вопрос совершенно непонятен.
+
+%sh
+cat> ./ilya111/execHiveCmd.sh <<EOF
+#!/bin/bash
+#----------------------------------------------#
+#                execHiveCmd.sh                #
+# exec Hive, redirect output, check results    #
+#----------------------------------------------#
+#
+full_name_script=\$0
+
+echo "Старт выполнения скрипта \$full_name_script"
+echo "------------"
+hive_ql=\$1
+short_name=\$(basename \$full_name_script)
+
+tmp_file="./ilya111/sql.txt"
+
+echo -e "!connect jdbc:hive2://10.93.1.9:10000 hive eee;\n\$hive_ql;" > \$tmp_file
+
+beeline -f \$tmp_file 1> hive_stdout.txt 2> hive_stderr.txt
+
+if [ \$? -ne "0" ]
+then 
+    echo "There were errors while hive-ing, check hive_stderr.txt"
+    exit 1
+else
+    echo "done"
+fi
+
+rm \$tmp_file
+EOF

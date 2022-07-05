@@ -1,0 +1,18 @@
+%sh
+cat> ./ilya111/sqoopImport.sh <<EOF
+#!/bin/bash
+#----------------------------------------------#
+#                sqootImport.sh                #
+# run sqoop, redirect protocols, check results #
+#----------------------------------------------#
+
+tabName=$1 
+dbName=$2 
+echo "Importing $tabName table into database $dbName with sqoop import..." 
+hdfs dfs -rm -r -f -skipTrash $tabName >sqoop_stdout.txt 2>sqoop_stderr.txt 
+echo "Done1"
+export JAVA_HOME="/usr" 
+echo "Done2"
+/usr/lib/sqoop/bin/sqoop import --connect 'jdbc:mysql://10.93.1.9/skillfactory' --username mysql --password arenadata --hive-import -m 1 --table $tabName --hive-table $dbName.$tabName
+echo "Done" 
+EOF
